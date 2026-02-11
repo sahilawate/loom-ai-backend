@@ -3,7 +3,7 @@ import { pool } from "../db/index.js";
 
 const router = Router();
 
-// 1. PLACE ORDER
+// 1. PLACE ORDER (Deducts Stock)
 router.post("/", async (req, res) => {
   const { sessionId, totalAmount } = req.body;
 
@@ -25,7 +25,7 @@ router.post("/", async (req, res) => {
     );
     const orderId = orderRes.rows[0].id;
 
-    // D. Build Receipt (Awaited to ensure data integrity)
+    // D. Build Receipt & Deduct Inventory
     let receiptText = ""; 
     for (const item of cart.rows) {
       const v = await pool.query(
@@ -35,6 +35,12 @@ router.post("/", async (req, res) => {
       const price = v.rows[0]?.price || 0;
       const name = v.rows[0]?.name || "Item";
 
+      // CRITICAL: Subtract Quantity from Inventory
+      await pool.query(
+        "UPDATE inventory SET quantity = quantity - $1 WHERE variant_id = $2",
+        [item.quantity, item.variant_id]
+      );
+
       await pool.query(
         "INSERT INTO order_items (order_id, variant_id, quantity, price) VALUES ($1, $2, $3, $4)", 
         [orderId, item.variant_id, item.quantity, price]
@@ -42,7 +48,7 @@ router.post("/", async (req, res) => {
       receiptText += `• ${name} (x${item.quantity}) - ₹${price * item.quantity}\n`;
     }
 
-    // 🟢 E. Generate Unique Marker for Frontend Polling
+    // E. Generate Unique Marker
     const waMarker = `[WA_ORDER_${Date.now()}]`;
     const waMessage = `${waMarker} ✅ *Order Placed Successfully!* 🎉\n\n🆔 *Order ID:* #${orderId.slice(0,8)}\n\n🛒 *Items:*\n${receiptText}\n💰 *Total Paid:* ₹${totalAmount}\n\nWould you like to see similar items?`;
 
@@ -52,13 +58,13 @@ router.post("/", async (req, res) => {
         [sessionId, JSON.stringify({ message: `Order #${orderId.slice(0,8)} sent to warehouse.` })]
     );
 
-    // 🟢 G. Log Post-Purchase Support Agent (The Anchor)
+    // G. Log Post-Purchase Support Agent
     await pool.query(
       "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Post-Purchase Support Agent', 'ORDER_CONFIRMATION', $2)", 
       [sessionId, JSON.stringify({ message: waMessage, orderId })]
     );
 
-    // H. Clear Cart & Respond
+    // H. Clear Cart
     await pool.query("DELETE FROM cart_items WHERE session_id = $1", [sessionId]);
     res.json({ success: true, orderId });
 
@@ -68,17 +74,34 @@ router.post("/", async (req, res) => {
   }
 });
 
-// 2. CANCEL ORDER
+// 2. CANCEL ORDER (Restocks Inventory)
 router.post("/cancel", async (req, res) => {
   const { orderId, sessionId } = req.body;
   try {
+    // 1. Find items to restock
+    const items = await pool.query("SELECT variant_id, quantity FROM order_items WHERE order_id = $1", [orderId]);
+    
+    // 2. Loop through and ADD stock back
+    for (const item of items.rows) {
+        await pool.query(
+            "UPDATE inventory SET quantity = quantity + $1 WHERE variant_id = $2", 
+            [item.quantity, item.variant_id]
+        );
+    }
+
+    // 3. Mark order as cancelled
     await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [orderId]);
+    
+    // 4. Log Event
     await pool.query(
       "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Customer', 'ORDER_CANCELLED', $2)", 
-      [sessionId, JSON.stringify({ message: `❌ Order #${orderId.slice(0,8)} was cancelled.` })]
+      [sessionId, JSON.stringify({ message: `❌ Order #${orderId.slice(0,8)} was cancelled!` })]
     );
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: "Cancel failed" }); }
+  } catch (err) { 
+    console.error("Cancel Error:", err);
+    res.status(500).json({ error: "Cancel failed" }); 
+  }
 });
 
 // 3. GET ORDERS

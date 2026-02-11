@@ -3,7 +3,7 @@ import { pool } from "../db/index.js";
 
 const router = Router();
 
-// 1. GET CART (Fixed to join product_images)
+// 1. GET CART
 router.get("/", async (req, res) => {
   const { sessionId } = req.query;
   try {
@@ -11,12 +11,10 @@ router.get("/", async (req, res) => {
       `SELECT ci.*, 
               COALESCE(v.price, 0) as price, 
               COALESCE(p.name, 'Item #' || ci.variant_id) as name,
-              img.image_url
+              p.image_url
        FROM cart_items ci
        LEFT JOIN product_variants v ON ci.variant_id = v.id
        LEFT JOIN products p ON v.product_id = p.id
-       -- 🟢 Fixed: Join with product_images to get the correct column
-       LEFT JOIN product_images img ON img.product_id = p.id AND img.is_primary = true
        WHERE ci.session_id = $1`,
       [sessionId]
     );
@@ -31,17 +29,14 @@ router.get("/", async (req, res) => {
 router.post("/add", async (req, res) => {
   const { sessionId, variantId, quantity = 1 } = req.body;
   try {
-    // Ensure session exists
     await pool.query(
       "INSERT INTO sessions (id, channel) VALUES ($1, 'mobile') ON CONFLICT (id) DO NOTHING",
       [sessionId]
     );
-
     const check = await pool.query(
       "SELECT * FROM cart_items WHERE session_id = $1 AND variant_id = $2",
       [sessionId, variantId]
     );
-
     if (check.rows.length > 0) {
       await pool.query(
         "UPDATE cart_items SET quantity = quantity + $1 WHERE session_id = $2 AND variant_id = $3",
@@ -54,7 +49,7 @@ router.post("/add", async (req, res) => {
       );
     }
     
-    // Agent Timeline Log
+    // Agent Timeline Log: Inventory Agent
     try {
         await pool.query(
             "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Inventory Agent', 'CHECK_STOCK', $2)",
@@ -64,7 +59,6 @@ router.post("/add", async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Add to Cart Error:", err.message);
     res.status(500).json({ error: "Failed to add to cart" });
   }
 });
@@ -96,7 +90,6 @@ router.delete("/clear", async (req, res) => {
     await pool.query("DELETE FROM cart_items WHERE session_id = $1", [sessionId]);
     res.json({ success: true });
   } catch (err) {
-    console.error("Clear Cart Error:", err.message);
     res.status(500).json({ error: "Failed to clear cart" });
   }
 });
