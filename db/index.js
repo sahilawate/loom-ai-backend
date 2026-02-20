@@ -1,10 +1,11 @@
-import pkg from "pg";
-const { Pool } = pkg;
+import pg from 'pg';
+import 'dotenv/config';
 
-// Use the DATABASE_URL environment variable from Render
+const { Pool } = pg;
+
+const isProduction = process.env.DATABASE_URL.includes('supabase.co') || process.env.NODE_ENV === 'production';
+
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false // Required for secure cloud database connections
-  }
+  ssl: isProduction ? { rejectUnauthorized: false } : false
 });

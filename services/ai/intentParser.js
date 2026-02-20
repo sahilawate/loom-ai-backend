@@ -1,59 +1,51 @@
-// backend/services/ai/intentParser.js
+import fetch from "node-fetch";
+import "dotenv/config";
+
+// AI understands what product the user is currently looking at
+export async function parseIntent(message, context = null) {
+  const contextData = context ? `
+    THE USER IS CURRENTLY VIEWING THIS PRODUCT IN THE SIDE PANEL:
+    - Name: ${context.name}
+    - Brand: ${context.brand}
+    - Price: ₹${context.price}
+    - Available Sizes: ${context.sizes ? context.sizes.join(", ") : 'None'}
+    - Technical Specs: ${JSON.stringify(context.specs)}
+  ` : "The user is not currently viewing a specific product.";
+
 const SYSTEM_PROMPT = `
-You are an AI shopping assistant for a fashion store.
-Your job:
-- Understand user intent and map it to our supported categories.
-- Supported categories: "shirt", "tshirt", "jeans", "blazer", "dress"
-- **CRITICAL Mapping Rules**:
-  * "pant", "pants", "trouser", "denim", "bottoms" -> map to "jeans"
-  * "tee", "top" -> map to "tshirt"
-  * "coat", "suit jacket" -> map to "blazer"
-  * "gown" -> map to "dress"
-- Return ONLY valid JSON.
+You are a Professional AI Stylist for Loom AI.
+Your job is to understand user intent, answer product questions, and execute actions.
 
-Output JSON format:
+${contextData}
+
+RULES:
+1. If the user asks a question about the product they are viewing (e.g., "What material is this?", "Is this for summer?"), use the Technical Specs to answer. Set intent to "product_question" and provide a helpful answer in the "reply" field.
+2. If the user commands you to add the active item to the cart (e.g., "Add size M", "Buy 2 of these"), set intent to "add_to_cart". Extract the "size" and "quantity" (default 1). Provide a confirmation in "reply".
+3. If they are searching for general items ("shirts", "office clothes"), set intent to "browse" and extract "category", "mission", and "maxPrice".
+4. If they just say a clothing item (e.g., "shirts", "jeans"), the intent is ALWAYS "browse".
+
+Output ONLY valid JSON:
 {
-  "category": "shirt" | "tshirt" | "jeans" | "blazer" | "dress" | null,
+  "intent": "browse" | "add_to_cart" | "product_question" | "greeting" | "unknown",
+  "category": string | null,
   "maxPrice": number | null,
-  "size": "S" | "M" | "L" | null,
-  "intent": "browse" | "buy" | "question",
-  "confidence": "high" | "medium" | "low"
+  "gender": "Men" | "Women" | "Unisex",
+  "mission": string | null,
+  "size": string | null,
+  "quantity": number,
+  "reply": string | null
 }
-`;
+  `;
 
-function keywordFallback(message) {
-  const lower = message.toLowerCase();
-  
-  if (lower.includes("buy") || lower.includes("checkout")) return { intent: "buy", category: null };
-
-  const priceMatch = lower.match(/(\d+)/);
-  const maxPrice = priceMatch ? parseInt(priceMatch[0]) : null;
-
-  let category = null;
-  // Keyword Mapping logic for Fallback
-  if (lower.includes("tshirt") || lower.includes("t-shirt") || lower.includes("tee")) {
-    category = "tshirt";
-  } else if (lower.includes("shirt")) {
-    category = "shirt";
-  } else if (lower.includes("jean") || lower.includes("pant") || lower.includes("trouser") || lower.includes("denim")) {
-    category = "jeans";
-  } else if (lower.includes("blazer") || lower.includes("coat")) {
-    category = "blazer";
-  } else if (lower.includes("dress") || lower.includes("gown")) {
-    category = "dress";
+  function fallback() {
+    return { intent: "browse", category: message.toLowerCase().includes("shirt") ? "shirt" : null, quantity: 1, reply: null };
   }
 
-  if (category) return { intent: "browse", category, maxPrice };
-  
-  return { intent: "question", category: null };
-}
-
-export async function parseIntent(message) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 4000); 
+  const timeoutId = setTimeout(() => controller.abort(), 5000); 
 
   try {
-    if (!process.env.GEMINI_API_KEY) return keywordFallback(message);
+    if (!process.env.GEMINI_API_KEY) return fallback();
 
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
@@ -66,17 +58,22 @@ export async function parseIntent(message) {
         })
       }
     );
-
     clearTimeout(timeoutId);
 
     const data = await res.json();
-    if (!data.candidates || data.candidates.length === 0) return keywordFallback(message);
+    if (!data.candidates || data.candidates.length === 0) return fallback();
 
     const textResponse = data.candidates[0].content.parts[0].text;
-    const jsonString = textResponse.replace(/```json|```/g, "").trim();
-    return JSON.parse(jsonString);
+    
+    // BULLETPROOF JSON EXTRACTION
+    const start = textResponse.indexOf('{');
+    const end = textResponse.lastIndexOf('}');
+    if (start === -1 || end === -1) throw new Error("No JSON found");
+
+    return JSON.parse(textResponse.substring(start, end + 1));
 
   } catch (error) {
-    return keywordFallback(message);
+    console.error("Gemini Error:", error.message);
+    return fallback();
   }
 }

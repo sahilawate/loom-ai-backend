@@ -27,7 +27,7 @@ export function extractIntentAndEntities(message) {
   const priceMatch = text.match(/(under|below|less than)\s*(₹?\s*)?(\d+)/);
   if (priceMatch) maxPrice = Number(priceMatch[3]);
 
-  // 🚨 PRICE WITHOUT CATEGORY IS INVALID
+  // PRICE WITHOUT CATEGORY IS INVALID
   if (!category && maxPrice !== null) {
     return {
       intent: "clarify",

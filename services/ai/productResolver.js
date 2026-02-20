@@ -1,19 +1,16 @@
 import { pool } from "../../db/index.js";
 
-export async function findProducts({ category, maxPrice }) {
+export async function findProducts({ category, maxPrice, gender, mission }) {
   try {
     const params = [];
     
-    // 🟢 CORRECTED QUERY: Join with product_images table to get the URL
+    // PROFESSIONAL UPDATE: Fetch sizes array and all Agentic Metadata for the UI
     let query = `
       SELECT
-        p.id,
-        p.name,
-        p.category,
+        p.id, p.name, p.category, p.brand, p.keywords, p.specs, p.occasion,
         img.image_url, 
-        v.id AS variant_id,
-        v.size,
-        v.price
+        v.id AS variant_id, v.sizes, v.price, v.discount, 
+        i.quantity
       FROM products p
       JOIN product_variants v ON v.product_id = p.id
       JOIN inventory i ON i.variant_id = v.id
@@ -22,28 +19,36 @@ export async function findProducts({ category, maxPrice }) {
         AND i.quantity > 0
     `;
 
-    // Only add category filter if it exists
+    // FUZZY SEARCH & PLURAL LOGIC
     if (category) {
-      params.push(category);
-      query += ` AND p.category ILIKE $${params.length}`; 
+      let searchTerm = category.toLowerCase().trim();
+      // Logic to handle plurals: "shirts" -> "shirt"
+      if (searchTerm.endsWith('s') && !['dress', 'jeans', 'fabric'].includes(searchTerm)) {
+         searchTerm = searchTerm.slice(0, -1);
+      }
+      
+      params.push(`%${searchTerm}%`);
+      // Search BOTH Category and Name (Increases accuracy)
+      query += ` AND (p.category ILIKE $${params.length} OR p.name ILIKE $${params.length})`; 
     }
 
-    // Only add price filter if it exists
     if (maxPrice) {
       params.push(maxPrice);
       query += ` AND v.price <= $${params.length}`;
     }
 
-    query += `
-      ORDER BY v.price ASC
-      LIMIT 8
-    `;
+    // AGENTIC FILTER: Gender Extraction
+    if (gender && gender !== 'Unisex') {
+      params.push(`%${gender}%`);
+      query += ` AND p.gender ILIKE $${params.length}`;
+    }
+
+    query += ` ORDER BY RANDOM() LIMIT 12`;
 
     const { rows } = await pool.query(query, params);
     return rows;
 
   } catch (error) {
-    // This logs the specific database error to your Render dashboard
     console.error("Product Resolver Error:", error);
     return []; 
   }
