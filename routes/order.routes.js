@@ -3,29 +3,40 @@ import { pool } from "../db/index.js";
 
 const router = Router();
 
+// DB AUTO-PATCHER: Fixes the "orders_status_check" constraint error automatically!
+(async function patchDatabase() {
+    try {
+        console.log("🛠️ Checking database constraints...");
+        await pool.query(`ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check;`);
+        await pool.query(`
+            ALTER TABLE orders ADD CONSTRAINT orders_status_check 
+            CHECK (status IN ('pending', 'processing', 'packed', 'shipped', 'delivered', 'completed', 'cancelled'));
+        `);
+        console.log("✅ Database constraints patched successfully for Agentic Fulfillment.");
+    } catch (e) {
+        console.warn("⚠️ Note: Could not auto-patch DB constraints (might already be fixed):", e.message);
+    }
+})();
+
 // 1. PLACE ORDER (Deducts Stock)
 router.post("/", async (req, res) => {
-  const { sessionId, totalAmount } = req.body;
+  const { sessionId, waSessionId, totalAmount } = req.body;
 
   try {
-    // A. Log Payment Agent
     await pool.query(
         "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Payment Agent', 'PROCESS_PAYMENT', $2)",
         [sessionId, JSON.stringify({ message: `Processing payment of ₹${totalAmount}...` })]
     );
 
-    // B. Validate Cart
     const cart = await pool.query("SELECT * FROM cart_items WHERE session_id = $1", [sessionId]);
     if (cart.rows.length === 0) return res.status(400).json({ error: "Empty cart" });
 
-    // C. Create Order Record
     const orderRes = await pool.query(
-      "INSERT INTO orders (session_id, total_amount, status) VALUES ($1, $2, 'pending') RETURNING id",
+      "INSERT INTO orders (session_id, total_amount, status) VALUES ($1, $2, 'processing') RETURNING id",
       [sessionId, totalAmount]
     );
     const orderId = orderRes.rows[0].id;
 
-    // D. Build Receipt & Deduct Inventory
     let receiptText = ""; 
     for (const item of cart.rows) {
       const v = await pool.query(
@@ -35,7 +46,6 @@ router.post("/", async (req, res) => {
       const price = v.rows[0]?.price || 0;
       const name = v.rows[0]?.name || "Item";
 
-      // CRITICAL: Subtract Quantity from Inventory
       await pool.query(
         "UPDATE inventory SET quantity = quantity - $1 WHERE variant_id = $2",
         [item.quantity, item.variant_id]
@@ -45,26 +55,29 @@ router.post("/", async (req, res) => {
         "INSERT INTO order_items (order_id, variant_id, quantity, price) VALUES ($1, $2, $3, $4)", 
         [orderId, item.variant_id, item.quantity, price]
       );
-      receiptText += `• ${name} (x${item.quantity}) - ₹${price * item.quantity}\n`;
+      
+      const sizeDisplay = item.size !== 'Universal' ? ` (Size: ${item.size})` : '';
+      receiptText += `• ${name}${sizeDisplay} (x${item.quantity}) - ₹${price * item.quantity}\n`;
     }
 
-    // E. Generate Unique Marker
     const waMarker = `[WA_ORDER_${Date.now()}]`;
-    const waMessage = `${waMarker} ✅ *Order Placed Successfully!* 🎉\n\n🆔 *Order ID:* #${orderId.slice(0,8)}\n\n🛒 *Items:*\n${receiptText}\n💰 *Total Paid:* ₹${totalAmount}\n\nWould you like to see similar items?`;
+    
+    // 🟢 UPDATED MESSAGE: Added the conversational follow-up at the end!
+    const waMessage = `${waMarker} ✅ *Order Placed Successfully!* 🎉\n\n🆔 *Order ID:* #${orderId.slice(0,8)}\n\n🛒 *Items:*\n${receiptText}\n💰 *Total :* ₹${totalAmount}\n\n[TRACK_ORDER_BTN]\n\nWould you like me to find similar items or help you continue shopping?`;
 
-    // F. Log Fulfillment Agent
     await pool.query(
-        "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Fulfillment Agent', 'ORDER_PACKED', $2)",
+        "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Fulfillment Agent', 'ORDER_RECEIVED', $2)",
         [sessionId, JSON.stringify({ message: `Order #${orderId.slice(0,8)} sent to warehouse.` })]
     );
 
-    // G. Log Post-Purchase Support Agent
-    await pool.query(
-      "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Post-Purchase Support Agent', 'ORDER_CONFIRMATION', $2)", 
-      [sessionId, JSON.stringify({ message: waMessage, orderId })]
-    );
+    if (waSessionId) {
+      await pool.query("INSERT INTO sessions (id, channel) VALUES ($1, 'whatsapp') ON CONFLICT (id) DO NOTHING", [waSessionId]);
+      await pool.query(
+        "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Post-Purchase Support Agent', 'ORDER_CONFIRMATION', $2)", 
+        [waSessionId, JSON.stringify({ message: waMessage, orderId })]
+      );
+    }
 
-    // H. Clear Cart
     await pool.query("DELETE FROM cart_items WHERE session_id = $1", [sessionId]);
     res.json({ success: true, orderId });
 
@@ -74,14 +87,35 @@ router.post("/", async (req, res) => {
   }
 });
 
-// 2. CANCEL ORDER (Restocks Inventory)
+// 2. UPDATE ORDER STATUS
+router.post("/update", async (req, res) => {
+    const { orderId, status } = req.body;
+    try {
+        await pool.query('UPDATE orders SET status = $1 WHERE id = $2', [status, orderId]);
+        
+        const orderInfo = await pool.query('SELECT session_id FROM orders WHERE id = $1', [orderId]);
+        const orderSessionId = orderInfo.rows[0]?.session_id;
+
+        if (orderSessionId) {
+            await pool.query(
+                "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Operations Agent', 'STATUS_UPDATED', $2)", 
+                [orderSessionId, JSON.stringify({ orderId, status, message: `Your order was updated to ${status}.` })]
+            );
+        }
+
+        res.json({ success: true, message: `Order marked as ${status}` });
+    } catch (e) {
+        console.error("Update Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 3. CANCEL ORDER
 router.post("/cancel", async (req, res) => {
   const { orderId, sessionId } = req.body;
   try {
-    // 1. Find items to restock
     const items = await pool.query("SELECT variant_id, quantity FROM order_items WHERE order_id = $1", [orderId]);
     
-    // 2. Loop through and ADD stock back
     for (const item of items.rows) {
         await pool.query(
             "UPDATE inventory SET quantity = quantity + $1 WHERE variant_id = $2", 
@@ -89,10 +123,8 @@ router.post("/cancel", async (req, res) => {
         );
     }
 
-    // 3. Mark order as cancelled
     await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [orderId]);
     
-    // 4. Log Event
     await pool.query(
       "INSERT INTO agent_events (session_id, agent_name, action, metadata) VALUES ($1, 'Customer', 'ORDER_CANCELLED', $2)", 
       [sessionId, JSON.stringify({ message: `❌ Order #${orderId.slice(0,8)} was cancelled!` })]
@@ -104,14 +136,15 @@ router.post("/cancel", async (req, res) => {
   }
 });
 
-// 3. GET ORDERS
+// 4. GET ORDERS
 router.get("/all", async (req, res) => {
   try {
     const { sessionId } = req.query;
     let query = `
-      SELECT o.*, json_agg(json_build_object('name', COALESCE(p.name, 'Item'), 'qty', oi.quantity)) as items 
+      SELECT o.*, json_agg(json_build_object('name', COALESCE(p.name, 'Item'), 'qty', oi.quantity, 'size', ci.size, 'image', (SELECT image_url FROM product_images WHERE product_id = p.id LIMIT 1))) as items 
       FROM orders o 
       LEFT JOIN order_items oi ON o.id = oi.order_id 
+      LEFT JOIN cart_items ci ON ci.variant_id = oi.variant_id
       LEFT JOIN product_variants v ON oi.variant_id = v.id 
       LEFT JOIN products p ON v.product_id = p.id 
     `;
